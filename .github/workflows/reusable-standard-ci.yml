@@ -1,0 +1,310 @@
+name: Reusable Standard CI
+
+on:
+  workflow_call:
+    inputs:
+      build_command:
+        description: Command that builds or prepares the application
+        required: true
+        type: string
+      unit_test_command:
+        description: Command that runs unit tests and creates JUnit and Cobertura reports
+        required: true
+        type: string
+      lint_command:
+        description: Command that runs linting or static quality checks
+        required: false
+        type: string
+        default: ""
+      junit_report_path:
+        description: Path to the JUnit XML report
+        required: false
+        type: string
+        default: reports/junit/results.xml
+      cobertura_report_path:
+        description: Path to the Cobertura XML report
+        required: false
+        type: string
+        default: reports/coverage/cobertura.xml
+      coverage_language:
+        description: Primary language used by GitHub Code Quality
+        required: true
+        type: string
+      coverage_threshold:
+        description: Advisory coverage percentage
+        required: false
+        type: number
+        default: 80
+      coverage_enforcement_date:
+        description: Date on which coverage is expected to become blocking
+        required: false
+        type: string
+        default: "2027-01-20"
+      publish_artifact:
+        description: Upload a build artifact after blocking checks pass
+        required: false
+        type: boolean
+        default: true
+      artifact_name:
+        description: Name of the uploaded build artifact
+        required: false
+        type: string
+        default: application-package
+      artifact_path:
+        description: File or directory to upload as the build artifact
+        required: false
+        type: string
+        default: dist/**
+
+permissions:
+  contents: read
+  pull-requests: write
+  code-quality: write
+
+jobs:
+  standard-ci:
+    name: Standard CI
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout application repository
+        uses: actions/checkout@v4
+
+      - name: Build
+        id: build
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          ${{ inputs.build_command }}
+
+      - name: Run unit tests
+        id: tests
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          ${{ inputs.unit_test_command }}
+
+      - name: Validate JUnit report
+        id: junit
+        if: steps.tests.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        env:
+          JUNIT_REPORT: ${{ inputs.junit_report_path }}
+        run: |
+          if [[ ! -f "$JUNIT_REPORT" ]]; then
+            echo "::error::JUnit XML report was not found at $JUNIT_REPORT"
+            exit 1
+          fi
+          echo "JUnit report found at $JUNIT_REPORT"
+
+      - name: Evaluate code coverage
+        id: coverage
+        if: steps.tests.outcome == 'success'
+        shell: bash
+        env:
+          COVERAGE_REPORT: ${{ inputs.cobertura_report_path }}
+          COVERAGE_THRESHOLD: ${{ inputs.coverage_threshold }}
+        run: |
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          report = os.environ["COVERAGE_REPORT"]
+          threshold = float(os.environ["COVERAGE_THRESHOLD"])
+          output_file = os.environ["GITHUB_OUTPUT"]
+
+          status = "missing"
+          percent = "N/A"
+          message = f"Coverage report was not found at {report}."
+
+          if os.path.isfile(report):
+              try:
+                  root = ET.parse(report).getroot()
+                  line_rate = root.attrib.get("line-rate")
+                  if line_rate is None:
+                      status = "invalid"
+                      message = "Cobertura report is missing the root line-rate attribute."
+                  else:
+                      value = float(line_rate) * 100
+                      percent = f"{value:.2f}"
+                      if value >= threshold:
+                          status = "pass"
+                          message = f"Coverage is {value:.2f}%, meeting the {threshold:.2f}% advisory target."
+                      else:
+                          status = "warning"
+                          message = f"Coverage is {value:.2f}%, below the {threshold:.2f}% advisory target."
+              except Exception as error:
+                  status = "invalid"
+                  message = f"Coverage report could not be parsed: {error}"
+
+          with open(output_file, "a", encoding="utf-8") as output:
+              output.write(f"status={status}\n")
+              output.write(f"percent={percent}\n")
+              output.write(f"message={message}\n")
+
+          print(message)
+          if status != "pass":
+              print(f"::warning::{message}")
+          PY
+
+      - name: Upload coverage to GitHub
+        id: coverage-upload
+        if: >-
+          steps.coverage.outputs.status != 'missing' &&
+          steps.coverage.outputs.status != 'invalid' &&
+          (github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository)
+        continue-on-error: true
+        uses: actions/upload-code-coverage@v1
+        with:
+          file: ${{ inputs.cobertura_report_path }}
+          language: ${{ inputs.coverage_language }}
+          label: golden-path-standard-ci
+
+      - name: Run code-quality checks
+        id: lint
+        if: inputs.lint_command != '' && steps.build.outcome == 'success'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          ${{ inputs.lint_command }}
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-evidence
+          path: |
+            ${{ inputs.junit_report_path }}
+            ${{ inputs.cobertura_report_path }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish build artifact
+        id: artifact
+        if: >-
+          inputs.publish_artifact &&
+          steps.build.outcome == 'success' &&
+          steps.tests.outcome == 'success' &&
+          steps.junit.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ inputs.artifact_path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Write workflow summary
+        if: always()
+        shell: bash
+        env:
+          COVERAGE_PERCENT: ${{ steps.coverage.outputs.percent }}
+          COVERAGE_MESSAGE: ${{ steps.coverage.outputs.message }}
+          ENFORCEMENT_DATE: ${{ inputs.coverage_enforcement_date }}
+        run: |
+          {
+            echo "## Golden Path CI Summary"
+            echo
+            echo "| Check | Result | Enforcement |"
+            echo "|---|---|---|"
+            echo "| Build | ${{ steps.build.outcome }} | Blocking |"
+            echo "| Unit tests | ${{ steps.tests.outcome }} | Blocking |"
+            echo "| JUnit evidence | ${{ steps.junit.outcome }} | Blocking |"
+            echo "| Coverage | ${COVERAGE_PERCENT:-N/A}% | Advisory until $ENFORCEMENT_DATE |"
+            echo "| Code quality | ${{ steps.lint.outcome }} | Advisory |"
+            echo "| Artifact | ${{ steps.artifact.outcome }} | Required when enabled |"
+            echo
+            echo "> ${COVERAGE_MESSAGE:-Coverage was not evaluated.}"
+            echo
+            echo "> Security is enforced as a separate GitHub CodeQL/ruleset check."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update pull-request summary
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          COVERAGE_PERCENT: ${{ steps.coverage.outputs.percent }}
+          COVERAGE_MESSAGE: ${{ steps.coverage.outputs.message }}
+          ENFORCEMENT_DATE: ${{ inputs.coverage_enforcement_date }}
+          BUILD_RESULT: ${{ steps.build.outcome }}
+          TEST_RESULT: ${{ steps.tests.outcome }}
+          JUNIT_RESULT: ${{ steps.junit.outcome }}
+          LINT_RESULT: ${{ steps.lint.outcome }}
+          ARTIFACT_RESULT: ${{ steps.artifact.outcome }}
+        with:
+          script: |
+            const marker = '<!-- golden-path-standard-ci -->';
+            const display = (value) => {
+              if (!value || value === 'skipped') return 'Not run';
+              if (value === 'success') return 'Passed';
+              if (value === 'failure') return 'Failed';
+              return value;
+            };
+            const coveragePercent = process.env.COVERAGE_PERCENT || 'N/A';
+            const coverageMessage = process.env.COVERAGE_MESSAGE || 'Coverage was not evaluated.';
+            const body = `${marker}
+            ## Golden Path CI
+
+            | Check | Result |
+            |---|---|
+            | Build | ${display(process.env.BUILD_RESULT)} |
+            | Unit tests | ${display(process.env.TEST_RESULT)} |
+            | JUnit report | ${display(process.env.JUNIT_RESULT)} |
+            | Coverage | ${coveragePercent === 'N/A' ? 'N/A' : `${coveragePercent}%`} — **Advisory** |
+            | Code quality | ${display(process.env.LINT_RESULT)} — Advisory |
+            | Artifact | ${display(process.env.ARTIFACT_RESULT)} |
+            | Security | See separate CodeQL/security ruleset check |
+
+            > ${coverageMessage}
+
+            **Coverage rollout:** Coverage is currently a warning. Beginning
+            **${process.env.ENFORCEMENT_DATE}**, missing coverage or coverage below
+            the approved threshold is expected to block merging unless an approved
+            maintainer exception exists.
+            `;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 }
+            );
+            const existing = comments.find(
+              comment => comment.user?.type === 'Bot' && comment.body?.includes(marker)
+            );
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner, repo, comment_id: existing.id, body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number, body
+              });
+            }
+
+      - name: Enforce blocking checks
+        if: always()
+        shell: bash
+        run: |
+          if [[ "${{ steps.build.outcome }}" != "success" ]]; then
+            echo "::error::Build failed."
+            exit 1
+          fi
+          if [[ "${{ steps.tests.outcome }}" != "success" ]]; then
+            echo "::error::Unit tests failed."
+            exit 1
+          fi
+          if [[ "${{ steps.junit.outcome }}" != "success" ]]; then
+            echo "::error::JUnit test evidence is required."
+            exit 1
+          fi
+          if [[ "${{ inputs.publish_artifact }}" == "true" &&
+                "${{ steps.artifact.outcome }}" != "success" ]]; then
+            echo "::error::Artifact publishing was enabled but did not succeed."
+            exit 1
+          fi
+          echo "All blocking Standard CI checks passed."
