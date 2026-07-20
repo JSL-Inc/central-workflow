@@ -34,7 +34,7 @@ on:
         description: Advisory coverage percentage
         required: false
         type: number
-        default: 80
+        default: 101
       coverage_enforcement_date:
         description: Date on which coverage is expected to become blocking
         required: false
