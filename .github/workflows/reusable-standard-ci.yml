@@ -37,7 +37,7 @@ on:
         type: string
 
       publish_artifact:
-        description: Whether the application produces a publishable build artifact
+        description: Whether the application produces a build artifact
         required: false
         type: boolean
         default: true
@@ -53,6 +53,12 @@ on:
         required: false
         type: string
         default: dist/**
+
+# Centrally managed company policy.
+# These values cannot be changed by consuming repositories.
+env:
+  COVERAGE_THRESHOLD: "80"
+  COVERAGE_ADVISORY_END_DATE: "2027-01-20"
 
 permissions:
   contents: read
@@ -93,48 +99,92 @@ jobs:
           JUNIT_REPORT: ${{ inputs.junit_report_path }}
         run: |
           if [[ ! -f "$JUNIT_REPORT" ]]; then
-            echo "::error::JUnit XML report was not found at $JUNIT_REPORT"
+            echo "::error title=Missing test evidence::JUnit XML report was not found at $JUNIT_REPORT"
             exit 1
           fi
 
           echo "JUnit report found at $JUNIT_REPORT"
 
       # -----------------------------------------------------------------------
-      # Coverage
+      # Advisory coverage evaluation
       #
-      # Company policy:
-      #   Minimum coverage: 80%
-      #   Advisory through: 2027-01-20
-      #
-      # These values are intentionally not workflow inputs.
-      # The actual percentage and advisory enforcement mode are controlled by
-      # the organization-level GitHub code coverage ruleset.
+      # This step reads the Cobertura report only to provide developer feedback.
+      # The organization coverage ruleset remains the authoritative enforcement.
       # -----------------------------------------------------------------------
 
-      - name: Check for coverage report
-        id: coverage_report
+      - name: Evaluate code coverage
+        id: coverage
         shell: bash
         env:
           COVERAGE_REPORT: ${{ inputs.cobertura_report_path }}
         run: |
-          if [[ -f "$COVERAGE_REPORT" ]]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-            echo "message=Coverage report found at $COVERAGE_REPORT." >> "$GITHUB_OUTPUT"
-            echo "Coverage report found at $COVERAGE_REPORT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "message=Coverage report was not found at $COVERAGE_REPORT." >> "$GITHUB_OUTPUT"
-            echo "::warning::Coverage report was not found at $COVERAGE_REPORT"
-          fi
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          report = os.environ["COVERAGE_REPORT"]
+          threshold = float(os.environ["COVERAGE_THRESHOLD"])
+          advisory_end_date = os.environ["COVERAGE_ADVISORY_END_DATE"]
+          output_file = os.environ["GITHUB_OUTPUT"]
+
+          status = "missing"
+          percent = "N/A"
+          message = f"Coverage report was not found at {report}."
+
+          if os.path.isfile(report):
+              try:
+                  root = ET.parse(report).getroot()
+                  line_rate = root.attrib.get("line-rate")
+
+                  if line_rate is None:
+                      status = "invalid"
+                      message = (
+                          "Cobertura report is missing the root "
+                          "line-rate attribute."
+                      )
+                  else:
+                      coverage = float(line_rate) * 100
+                      percent = f"{coverage:.2f}"
+
+                      if coverage >= threshold:
+                          status = "pass"
+                          message = (
+                              f"Coverage is {percent}%, meeting the "
+                              f"{threshold:.0f}% target."
+                          )
+                      else:
+                          status = "warning"
+                          message = (
+                              f"Coverage is {percent}%, below the "
+                              f"{threshold:.0f}% target."
+                          )
+
+              except Exception as error:
+                  status = "invalid"
+                  message = f"Coverage report could not be parsed: {error}"
+
+          with open(output_file, "a", encoding="utf-8") as output:
+              output.write(f"status={status}\n")
+              output.write(f"percent={percent}\n")
+              output.write(f"message={message}\n")
+
+          print(message)
+
+          if status != "pass":
+              warning = (
+                  f"{message} Coverage is advisory through "
+                  f"{advisory_end_date}."
+              )
+              print(f"::warning title=Code coverage::{warning}")
+          PY
 
       - name: Upload coverage to GitHub
         id: coverage_upload
         if: >-
-          steps.coverage_report.outputs.available == 'true' &&
-          (
-            github.event_name != 'pull_request' ||
-            github.event.pull_request.head.repo.full_name == github.repository
-          )
+          (steps.coverage.outputs.status == 'pass' ||
+           steps.coverage.outputs.status == 'warning') &&
+          (github.event_name != 'pull_request' ||
+           github.event.pull_request.head.repo.full_name == github.repository)
         continue-on-error: true
         uses: actions/upload-code-coverage@v1
         with:
@@ -142,8 +192,14 @@ jobs:
           language: ${{ inputs.coverage_language }}
           label: standard-ci
 
+      - name: Report coverage upload issue
+        if: steps.coverage_upload.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning title=Coverage upload::The coverage report was generated but could not be uploaded to GitHub. Coverage remains advisory through $COVERAGE_ADVISORY_END_DATE."
+
       # -----------------------------------------------------------------------
-      # Advisory code-quality check
+      # Advisory code-quality checks
       # -----------------------------------------------------------------------
 
       - name: Run code-quality checks
@@ -155,8 +211,14 @@ jobs:
           set -euo pipefail
           ${{ inputs.lint_command }}
 
+      - name: Report code-quality warning
+        if: inputs.lint_command != '' && steps.lint.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning title=Code quality::The configured code-quality check failed. This check is currently advisory."
+
       # -----------------------------------------------------------------------
-      # Evidence and artifacts
+      # Evidence and build artifact
       # -----------------------------------------------------------------------
 
       - name: Upload test evidence
@@ -172,9 +234,9 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # GitHub Actions storage is being used for the proof of concept.
-      # A production implementation can replace this step with the approved
-      # Artifactory publishing workflow.
+      # GitHub Actions artifact storage is used for this proof of concept.
+      # A production version can replace this with the approved Artifactory
+      # publishing process.
       - name: Publish build artifact
         id: artifact
         if: inputs.publish_artifact
@@ -196,11 +258,15 @@ jobs:
           BUILD_RESULT: ${{ steps.build.outcome }}
           TEST_RESULT: ${{ steps.tests.outcome }}
           JUNIT_RESULT: ${{ steps.junit.outcome }}
-          COVERAGE_AVAILABLE: ${{ steps.coverage_report.outputs.available }}
-          COVERAGE_MESSAGE: ${{ steps.coverage_report.outputs.message }}
+
+          COVERAGE_STATUS: ${{ steps.coverage.outputs.status }}
+          COVERAGE_PERCENT: ${{ steps.coverage.outputs.percent }}
+          COVERAGE_MESSAGE: ${{ steps.coverage.outputs.message }}
           COVERAGE_UPLOAD_RESULT: ${{ steps.coverage_upload.outcome }}
+
           LINT_RESULT: ${{ steps.lint.outcome }}
           ARTIFACT_RESULT: ${{ steps.artifact.outcome }}
+
           LINT_CONFIGURED: ${{ inputs.lint_command != '' }}
           PUBLISH_ARTIFACT: ${{ inputs.publish_artifact }}
         run: |
@@ -224,33 +290,42 @@ jobs:
           {
             echo "## Standard CI"
             echo
-            echo "- **Build:** $(format_result "$BUILD_RESULT")"
-            echo "- **Unit tests:** $(format_result "$TEST_RESULT")"
-            echo "- **JUnit evidence:** $(format_result "$JUNIT_RESULT")"
+            echo "| Check | Result | Enforcement |"
+            echo "|---|---|---|"
+            echo "| Build | $(format_result "$BUILD_RESULT") | Blocking |"
+            echo "| Unit tests | $(format_result "$TEST_RESULT") | Blocking |"
+            echo "| JUnit evidence | $(format_result "$JUNIT_RESULT") | Blocking |"
 
-            if [[ "$COVERAGE_AVAILABLE" == "true" ]]; then
-              echo "- **Coverage report:** Found"
-              echo "- **Coverage upload:** $(format_result "$COVERAGE_UPLOAD_RESULT")"
+            if [[ "$COVERAGE_PERCENT" != "N/A" && -n "$COVERAGE_PERCENT" ]]; then
+              echo "| Code coverage | ${COVERAGE_PERCENT}% | Advisory |"
             else
-              echo "- **Coverage report:** ${COVERAGE_MESSAGE:-Not evaluated}"
+              echo "| Code coverage | Not available | Advisory |"
             fi
 
             if [[ "$LINT_CONFIGURED" == "true" ]]; then
-              echo "- **Code quality:** $(format_result "$LINT_RESULT") — Advisory"
+              echo "| Code quality | $(format_result "$LINT_RESULT") | Advisory |"
             else
-              echo "- **Code quality:** Not configured"
+              echo "| Code quality | Not configured | Advisory |"
             fi
 
             if [[ "$PUBLISH_ARTIFACT" == "true" ]]; then
-              echo "- **Build artifact:** $(format_result "$ARTIFACT_RESULT")"
+              echo "| Build artifact | $(format_result "$ARTIFACT_RESULT") | Blocking |"
             else
-              echo "- **Build artifact:** Not applicable"
+              echo "| Build artifact | Not applicable | Not applicable |"
             fi
 
             echo
-            echo "### Coverage policy"
+            echo "### Coverage details"
             echo
-            echo "- Minimum coverage: **80%**"
-            echo "- Coverage remains advisory through **2027-01-20**"
-            echo "- Enforcement is controlled by the organization code coverage ruleset"
+            echo "${COVERAGE_MESSAGE:-Coverage was not evaluated.}"
+            echo
+            echo "- Required target: **${COVERAGE_THRESHOLD}%**"
+            echo "- Advisory through: **${COVERAGE_ADVISORY_END_DATE}**"
+            echo "- Coverage ruleset enforcement is managed at the organization level"
+
+            if [[ "$COVERAGE_UPLOAD_RESULT" == "failure" ]]; then
+              echo "- GitHub coverage upload: **Failed — advisory**"
+            elif [[ "$COVERAGE_UPLOAD_RESULT" == "success" ]]; then
+              echo "- GitHub coverage upload: **Successful**"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
